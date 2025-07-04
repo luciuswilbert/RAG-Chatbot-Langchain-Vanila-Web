@@ -4,19 +4,20 @@ IN ORDER TO RUN THIS FILE WITHOUT CHAINLIT:
 2. Command = python app.py
 '''
 
-import fitz  # PyMuPDF
+from flask import Flask, render_template, request, jsonify
 import os
-import requests
-import chainlit as cl
-
-from langchain.embeddings.base import Embeddings
+import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
-from langchain.schema import SystemMessage, HumanMessage
+from langchain.schema import SystemMessage, HumanMessage, Document
 
 load_dotenv()
+
+app = Flask(__name__, static_folder='static', template_folder='templates')
+
+# Global variable to store the FAISS index
+faiss_db = None
 
 def get_azure_embeddings():
     """
@@ -57,179 +58,84 @@ def chunk_text(text, chunk_size=300, overlap=50):
         start += chunk_size - overlap
     return chunks
 
-def query_faiss(faiss_path, query, k=4):
-    embedding_fn = get_azure_embeddings()
-    faiss_db = FAISS.load_local(
-        faiss_path,
-        embeddings=embedding_fn,
-        allow_dangerous_deserialization=True
-    )
+def query_faiss(faiss_db, query, k=4):
     results = faiss_db.similarity_search(query, k=k)
-    return results  
+    return results
 
-async def generate_llm_answer_langchain(context, user_query, stream_message=None):
-    """
-    Uses LangChain AzureChatOpenAI to generate an answer from retrieved context and user query.
-    Supports streaming if stream_message is provided.
-    """
-    # These come from .env
+def generate_llm_answer_langchain(context, user_query):
     azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     azure_deployment = os.getenv("DEPLOYMENT_NAME")
     api_version = os.getenv("API_VERSION")
-
-    # Initialize the LangChain LLM with streaming
     llm = AzureChatOpenAI(
         azure_endpoint=azure_endpoint,
         openai_api_key=azure_api_key,
         deployment_name=azure_deployment,
         api_version=api_version,
         temperature=0.1,
-        streaming=True
+        streaming=False
     )
-
-    # Prepare messages
     system = SystemMessage(content="You are AI Assistant. Provide clear, accurate, and concise answers strictly based on the context provided. Ensure your responses are balanced in length—neither too brief nor overly detailed—delivering essential information effectively and efficiently. Avoid including any information not supported by the given context.")
     user = HumanMessage(content=f"Context:\n{context}\n\nUser Question: {user_query}\n\nAnswer using only the given context.")
+    response = llm.invoke([system, user])
+    return response.content.strip()
 
-    if stream_message:
-        # Stream the response
-        response_content = ""
-        async for chunk in llm.astream([system, user]):
-            if chunk.content:
-                response_content += chunk.content
-                await stream_message.stream_token(chunk.content)
-        await stream_message.update()
-        return response_content.strip()
-    else:
-        # Non-streaming response
-        response = llm.invoke([system, user])
-        return response.content.strip()
+# --- FLASK ROUTES ---
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-# Global variable to store the FAISS index
-faiss_db = None
-
-@cl.on_chat_start
-async def start():
-    """
-    Initialize the chatbot when the chat starts
-    """
+@app.route('/upload', methods=['POST'])
+def upload_pdf():
     global faiss_db
-    
-    # Check if FAISS index exists
-    if os.path.exists("my_faiss_index"):
-        await cl.Message(
-            content="Loading existing knowledge base...",
-            author="System"
-        ).send()
-        
-        # Load existing FAISS index
-        embedding_fn = get_azure_embeddings()
-        faiss_db = FAISS.load_local(
-            "my_faiss_index",
-            embeddings=embedding_fn,
-            allow_dangerous_deserialization=True
-        )
-        
-        await cl.Message(
-            content="You can now ask questions about the document.",
-            author="System"
-        ).send()
-    else:
-        await cl.Message(
-            content="No existing knowledge base found. Please upload a PDF file to create one.",
-            author="System"
-        ).send()
-
-@cl.on_message
-async def main(message: cl.Message):
-    """
-    Handle incoming messages and file uploads
-    """
-    global faiss_db
-    
-    # Check if this is a file upload
-    if message.elements:
-        # Handle file upload
-        for element in message.elements:
-            if hasattr(element, 'name') and element.name.lower().endswith('.pdf'):
-                await handle_pdf_upload(element)
-            else:
-                await cl.Message(
-                    content="❌ Please upload a PDF file.",
-                    author="System"
-                ).send()
-        return
-    
-    # Handle text message (question)
-    if faiss_db is None:
-        await cl.Message(
-            content="❌ No knowledge base available. Please upload a PDF file first.",
-            author="System"
-        ).send()
-        return
-    
-    # Get user query
-    user_query = message.content
-    
+    file = request.files.get('pdf')
+    if not file or not file.filename.lower().endswith('.pdf'):
+        return jsonify({'success': False, 'error': 'Please upload a PDF file.'}), 400
+    # Save uploaded PDF
+    upload_path = os.path.join('uploads', file.filename)
+    os.makedirs('uploads', exist_ok=True)
+    file.save(upload_path)
+    # Extract text and build FAISS
     try:
-        # Query FAISS for relevant context
-        results = faiss_db.similarity_search(user_query, k=4)
-        
-        # Prepare context
-        context = "\n\n".join([doc.page_content for doc in results])
-        
-        # Create a streaming message
-        msg = cl.Message(
-            content="",
-            author="Assistant"
-        )
-        await msg.send()
-        
-        # Stream the response
-        await generate_llm_answer_langchain(context, user_query, msg)
-        
-    except Exception as e:
-        await cl.Message(
-            content=f"❌ Error: {str(e)}",
-            author="System"
-        ).send()
-
-async def handle_pdf_upload(file_element):
-    """
-    Handle PDF file uploads
-    """
-    global faiss_db
-    
-    try:
-        # Extract text from PDF
-        extracted_text = extract_text_from_pdf(file_element.path)
-                
-        # Chunk the text
+        extracted_text = extract_text_from_pdf(upload_path)
         chunks = chunk_text(extracted_text)
-        
-        # Create embeddings and FAISS index
         embedding_fn = get_azure_embeddings()
         documents = [Document(page_content=chunk) for chunk in chunks]
-        
         faiss_db = FAISS.from_documents(
             documents=documents,
             embedding=embedding_fn
         )
-        
-        # Save the index
         faiss_db.save_local("my_faiss_index")
-        
-        await cl.Message(
-            content=f"You can now ask questions about the document.",
-            author="System"
-        ).send()
-        
+        return jsonify({'success': True, 'message': 'PDF uploaded and knowledge base created.'})
     except Exception as e:
-        await cl.Message(
-            content=f"❌ Error processing file: {str(e)}",
-            author="System"
-        ).send() 
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    global faiss_db
+    data = request.get_json()
+    user_message = data.get('message', '')
+    if faiss_db is None:
+        # Try to load existing index
+        if os.path.exists("my_faiss_index"):
+            embedding_fn = get_azure_embeddings()
+            faiss_db = FAISS.load_local(
+                "my_faiss_index",
+                embeddings=embedding_fn,
+                allow_dangerous_deserialization=True
+            )
+        else:
+            return jsonify({'success': False, 'error': 'No knowledge base available. Please upload a PDF first.'}), 400
+    try:
+        results = query_faiss(faiss_db, user_message, k=4)
+        context = "\n\n".join([doc.page_content for doc in results])
+        answer = generate_llm_answer_langchain(context, user_message)
+        return jsonify({'success': True, 'answer': answer})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
 
 # if __name__ == "__main__":
 #     pdf_path = "Resume - Lucius Wilbert Tjoa.pdf"  
